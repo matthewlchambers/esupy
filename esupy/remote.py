@@ -6,7 +6,13 @@ Functions for handling remote requests and parsing
 """
 import logging as log
 import requests
-import requests_ftp
+# This code exists because requests_ftp is only required for downloading data to create FBA datasets, so 
+# if it's not available, I want to be able to do other things.
+try:
+    import requests_ftp
+except ModuleNotFoundError as e:
+    print(f'{str(e)}, so downloading data to create Flow-By-Activity datasets will not be possible.')
+    
 
 def make_http_request(url):
     """
