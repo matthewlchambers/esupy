@@ -8,10 +8,10 @@ local directories
 import logging as log
 import os
 import pandas as pd
-import re
 import json
 import appdirs
-import xml.etree.ElementTree as ET
+import boto3
+from botocore.handlers import disable_signing
 from esupy.remote import make_url_request
 from esupy.util import strip_file_extension
 
@@ -19,7 +19,7 @@ from esupy.util import strip_file_extension
 class Paths:
     def __init__(self):
         self.local_path = appdirs.user_data_dir()
-        self.remote_path = 'https://edap-ord-data-commons.s3.amazonaws.com/'
+        self.remote_path = 'https://dmap-data-commons-ord.s3.amazonaws.com/'
 
 
 class FileMeta:
@@ -44,6 +44,7 @@ def load_preprocessed_output(file_meta, paths):
     """
     f = find_file(file_meta, paths)
     if os.path.exists(f):
+        log.info(f'Returning {f}')
         df = read_into_df(f)
         return df
     else:
@@ -53,8 +54,9 @@ def load_preprocessed_output(file_meta, paths):
 def download_from_remote(file_meta, paths, **kwargs):
     """
     Downloads one or more files from remote and stores locally based on the
-    most recent instance of that file. All files that share name_data, version,
-    and hash will be downloaded together.
+    most recent instance of that file. Most recent is determined by max
+    version number. All files that share name_data, version, and hash will
+    be downloaded together.
     :param file_meta: populated instance of class FileMeta
     :param paths: instance of class Paths
     :param kwargs: option to include 'subdirectory_dict', a dictionary that
@@ -67,7 +69,7 @@ def download_from_remote(file_meta, paths, **kwargs):
         base_url = base_url + file_meta.category + '/'
     files = get_most_recent_from_index(file_meta, paths)
     if files is None:
-        log.info('%s not found in %s', file_meta.name_data, base_url)
+        log.info(f'{file_meta.name_data} not found in {base_url}')
     else:
         for f in files:
             url = base_url + f
@@ -87,7 +89,10 @@ def download_from_remote(file_meta, paths, **kwargs):
                                           + '/' + subdirectory)
                 file = folder + "/" + f
                 create_paths_if_missing(file)
-                log.info('%s saved to %s', f, folder)
+                log.info(f'{f} downloaded from'
+                         f' {paths.remote_path}index.html?prefix='
+                         f'{file_meta.tool}/{file_meta.category} and saved to '
+                         f'{folder}')
                 with open(file, 'wb') as f:
                     f.write(r.content)
     return status
@@ -134,7 +139,7 @@ def find_file(meta, paths):
         with os.scandir(path) as files:
             # List all file satisfying the criteria in the passed metadata
             matches = [f for f in files
-                       if meta.name_data in f.name
+                       if f.name.startswith(meta.name_data)
                        and meta.ext.lower() in f.name.lower()]
             # Sort files in reverse order by ctime (creation time on Windows,
             # last metadata modification time on Unix)
@@ -167,7 +172,7 @@ def get_most_recent_from_index(file_meta, paths):
     if len(df_ext) == 0:
         return None
     else:
-        df_ext = (df_ext.sort_values(by='date', ascending=False)
+        df_ext = (df_ext.sort_values(by=["version", "date"], ascending=False)
                   .reset_index(drop=True))
         # select first file name in list, extract the file version and git
         # hash, return list of files that include version/hash (to include
@@ -208,8 +213,9 @@ def write_df_to_file(df, paths, meta):
         else:
             log.error('Failed to save ' + file + '. '
                       + "Meta data lacks 'ext' property")
-    except Exception:
-        log.error('Failed to save ' + file + '.')
+    except Exception as e:
+        log.exception('Failed to save ' + file + '.')
+        raise e
 
 
 def read_into_df(file):
@@ -300,35 +306,27 @@ def create_paths_if_missing(file):
 
 
 def get_data_commons_index(file_meta, paths):
-    """Returns a dataframe of files available on data commmons for the
+    """
+    Returns a dataframe of files available on data commmons for the
     particular category
     :param file_meta: instance of class FileMeta
     :param paths: instance of class Path
     :param category: str of the category to search e.g. 'flowsa/FlowByActivity'
     :return: dataframe with 'date' and 'file_name' as fields
     """
-    index_url = '?prefix='
     subdirectory = file_meta.tool + '/'
     if file_meta.category != '':
         subdirectory = subdirectory + file_meta.category + '/'
-    url = paths.remote_path + index_url + subdirectory
-    listing = make_url_request(url)
-    # Code to convert XML to pd df courtesy of
-    # https://stackabuse.com/reading-and-writing-xml-files-in-python-with-panda
-    contents = ET.XML(listing.text)
-    data = []
-    cols = []
-    for i, child in enumerate(contents):
-        data.append([subchild.text for subchild in child])
-        cols.append(child.tag)
-    df = pd.DataFrame(data)
-    df.dropna(inplace=True)
-    try:
-        # only get first two columns and rename them name and last modified
-        df = df[[0, 1]]
-    except KeyError:
-        # no data found at url
-        return None
+
+    s3 = boto3.Session().resource('s3')
+    s3.meta.client.meta.events.register('choose-signer.s3.*', disable_signing)
+
+    bucket = s3.Bucket('dmap-data-commons-ord')
+    d = {}
+    for item in bucket.objects.filter(Prefix=subdirectory):
+        d[item.key] = item.last_modified
+    df = pd.DataFrame.from_dict(d, orient='index').reset_index()
+
     df.columns = ['file_name', 'last_modified']
     # Reformat the date to a pd datetime
     df['date'] = pd.to_datetime(df['last_modified'],
